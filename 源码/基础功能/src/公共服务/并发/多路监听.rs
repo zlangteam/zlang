@@ -5,14 +5,14 @@
 //   - 监听终止(名称, 终止器): 注册终止器停止信号事件。
 //   - 多路监听(选项列表): 任意事件就绪立即返回，返回 {"来源": 名称}。
 //
-// 关键修正：crossbeam 的 `Select::ready_deadline` 在超时且无操作就绪时会直接 panic，
-// 因此对超时选项启动一个计时线程，使其"到点即就绪"，统一用 `sel.ready()` 等待。
+// 超时用 `crossbeam::channel::after` 的定时接收端表达（到点即就绪），统一用 `sel.ready()` 等待。
+// 旧实现为每个超时选项起一个计时线程并睡满全程：监听提前返回后线程仍在睡，
+// 在循环里带长超时调用会堆积成千上万个睡眠线程。
 // 解释模式与编译模式都走此动态 Select API，保证行为一致（编译模式不生成 select! 宏）。
 
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam::channel::{bounded, Receiver, Select};
+use crossbeam::channel::{after, Receiver, Select};
 
 use super::值类型_::{键值, 拥有值};
 
@@ -44,7 +44,7 @@ pub fn 多路监听(选项列表: &[监听选项]) -> 拥有值 {
     // （crossbeam 的 Select 会持有接收端引用，故不能边注册边 push 同一 Vec）
     let mut 注册顺序: Vec<usize> = Vec::new();
     // 超时接收端先暂存，待所有通道/终止注册完毕后再注册
-    let mut 超时列表: Vec<(usize, Receiver<()>)> = Vec::new();
+    let mut 超时列表: Vec<(usize, Receiver<Instant>)> = Vec::new();
 
     for (opt_idx, opt) in 选项列表.iter().enumerate() {
         match opt {
@@ -60,15 +60,7 @@ pub fn 多路监听(选项列表: &[监听选项]) -> 拥有值 {
                 注册顺序.push(opt_idx);
             }
             监听选项::超时(_, 毫秒) => {
-                let (tx, rx) = bounded(0);
-                let tx_c = tx.clone();
-                let 毫秒 = *毫秒;
-                // 计时线程：到点后发送，使该超时操作就绪
-                thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(毫秒));
-                    let _ = tx_c.send(());
-                });
-                超时列表.push((opt_idx, rx));
+                超时列表.push((opt_idx, after(Duration::from_millis(*毫秒))));
             }
         }
     }
@@ -78,7 +70,7 @@ pub fn 多路监听(选项列表: &[监听选项]) -> 拥有值 {
         注册顺序.push(*opt_idx);
     }
 
-    // 始终用 ready()：超时由计时线程保证就绪，不会 panic
+    // 始终用 ready()：超时由定时接收端保证就绪，不会 panic
     let 触发索引 = sel.ready();
     let 真实选项索引 = 注册顺序[触发索引];
     let 名称 = 选项列表[真实选项索引].名称();

@@ -272,16 +272,18 @@ impl 编译器 {
         }
     }
 
-    pub(crate) fn 分配缓冲(&mut self, 构建器: &mut FunctionBuilder, 模块: &mut ObjectModule, 大小: i64) -> Result<cranelift_codegen::ir::Value, String> {
-        let 大小值 = 构建器.ins().iconst(types::I64, 大小);
-        let mut 分配签名 = Signature::new(CallConv::triple_default(&Triple::host()));
-        分配签名.params.push(AbiParam::new(types::I64));
-        分配签名.returns.push(AbiParam::new(types::I64));
-        let 分配函数 = 模块.declare_function("智语言分配内存", Linkage::Import, &分配签名)
-            .map_err(|e| format!("声明分配函数失败: {}", e))?;
-        let 调用 = 模块.declare_func_in_func(分配函数, &mut 构建器.func);
-        let 调用结果 = 构建器.ins().call(调用, &[大小值]);
-        Ok(构建器.func.dfg.first_result(调用结果))
+    /// 为一次运行时调用分配实参/输出缓冲：使用当前函数的栈槽。
+    ///
+    /// 旧实现每次都调 `智语言分配内存`（裸 alloc），而全仓库没有对应的释放——
+    /// 每次比较、堆操作、系统调用泄漏 64~96+ 字节，长循环最终耗尽内存（解释器无此问题）。
+    /// 这些缓冲只在紧随其后的那一次同步运行时调用期间被读写，调用返回即失效，
+    /// 因此放在栈上即可；每个调用点对应一个固定栈槽，循环内复用、递归时随帧分配。
+    pub(crate) fn 分配缓冲(&mut self, 构建器: &mut FunctionBuilder, _模块: &mut ObjectModule, 大小: i64) -> Result<cranelift_codegen::ir::Value, String> {
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+        let 字节 = if 大小 <= 0 { 8 } else { 大小 as u32 };
+        // 对齐 8 字节（align_shift = 3），与原 `智语言分配内存` 的对齐一致
+        let 槽 = 构建器.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 字节, 3));
+        Ok(构建器.ins().stack_addr(types::I64, 槽, 0))
     }
 
     pub(crate) fn 堆操作索引(&self, 码: &操作码) -> Option<usize> {

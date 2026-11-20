@@ -206,6 +206,11 @@ impl 编译器 {
         let triple = Triple::host();
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "none").unwrap();
+        // 非 Windows 目标生成位置无关代码：系统 cc 默认产出 PIE，非 PIC 目标文件的绝对重定位
+        // 会落进只读代码段（DT_TEXTREL 警告；lld/mold 或 -z text 下直接链接失败）。
+        if !cfg!(windows) {
+            flag_builder.set("is_pic", "true").unwrap();
+        }
         let isa = isa::lookup(triple)
             .map_err(|e| format!("不支持的架构: {}", e))?
             .finish(settings::Flags::new(flag_builder))

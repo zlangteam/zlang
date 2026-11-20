@@ -247,10 +247,31 @@ impl 链接器 {
         } else {
             // 完全查不到 → 重建
         }
+        let 旧路径 = self.运行时库路径.clone();
         self.构建运行时静态库(期望_base指纹)?;
         // 重建后重新查找（路径搜索基于当前可执行文件所在目录）
         self.运行时库路径 = None;
         self.自动查找运行时库();
+        // 查找顺序里「宿主同目录」排在重建落点（产出/release）之前：宿主在 产出/debug 时，
+        // 同目录那份过期的库会再次被选中，刚重建的新库反而用不上。
+        // 因此重建后以库内自带构建标识为准：查到的不同源，就改用重建落点里同源的那份。
+        let 同源 = |路径: &std::path::Path| {
+            base::构建标识::读取内嵌标识(路径).ok().as_deref() == Some(期望_base指纹)
+        };
+        if !self.运行时库路径.as_deref().map(|p| 同源(p)).unwrap_or(false) {
+            if let Some(落点目录) = std::env::current_exe().ok()
+                .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.join("release")))
+            {
+                for 名称 in &["base.lib", "libbase.a"] {
+                    let 候选 = 落点目录.join(名称);
+                    if 候选.exists() && 同源(&候选) {
+                        self.运行时库路径 = Some(候选);
+                        break;
+                    }
+                }
+            }
+        }
+        if self.运行时库路径.is_none() { self.运行时库路径 = 旧路径; }
         if self.运行时库路径.is_none() {
             return Err(
                 "已构建运行时静态库，但仍无法在已知路径定位 base.lib".to_string(),

@@ -47,6 +47,8 @@ pub struct Http待处理请求 {
     pub 请求头: HashMap<String, String>,
     pub 内容: String,
     pub 完整网址: String,
+    /// 未解码的请求目标（查询参数必须先按 & / = 切分再逐项解码）
+    pub 原始网址: String,
     pub 客户端地址: String,
 }
 
@@ -55,13 +57,19 @@ pub struct Http待处理请求 {
 // 供诊断与未来扩展）；显式豁免 dead_code，避免被误判为"死代码"。
 #[allow(dead_code)]
 enum 网络槽位 {
-    Tcp连接 { stream: Arc<Mutex<TcpStream>>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
-    Tcp连接TLS { stream: Arc<Mutex<Box<dyn 网络流>>>, 底层: Arc<TcpStream>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
+    Tcp连接 { stream: Arc<Mutex<TcpStream>>, 残余: Arc<Mutex<Vec<u8>>>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
+    Tcp连接TLS { stream: Arc<Mutex<Box<dyn 网络流>>>, 残余: Arc<Mutex<Vec<u8>>>, 底层: Arc<TcpStream>, 本地地址: String, 本地端口: u16, 远端地址: String, 远端端口: u16 },
     Tcp监听器(Arc<Mutex<TcpListener>>),
     Tcp监听器TLS { config: Arc<ServerConfig>, listener: Arc<Mutex<TcpListener>> },
     UdpSocket(Arc<Mutex<UdpSocket>>),
     流式响应 { reader: Arc<Mutex<Box<dyn BufRead + Send>>>, 状态码: u16, 响应头: HashMap<String,String>, 残余: Arc<Mutex<Vec<u8>>> },
-    网络服务 { 端口: u16 },
+    网络服务 {
+        端口: u16,
+        服务: Arc<crate::tiny_http::Server>,
+        停止: Arc<std::sync::atomic::AtomicBool>,
+        完成: Arc<std::sync::atomic::AtomicBool>,
+        线程标识: Arc<std::sync::OnceLock<std::thread::ThreadId>>,
+    },
     空槽,
 }
 
@@ -83,19 +91,24 @@ impl 网络资源表 {
         }
     }
     fn 释放(&mut self, 句柄: u64) {
+        // 无效句柄（<5000，例如对空值调用 关闭）直接忽略：旧实现在 debug 下减法溢出 panic。
+        if 句柄 < 5000 { return; }
         let i = 句柄 as usize - 5000;
-        if i < self.槽位.len() { self.槽位[i] = 网络槽位::空槽; self.空闲.push(i); }
+        if i >= self.槽位.len() { return; }
+        // 重复关闭必须幂等：旧实现每次都把 i 压入空闲链，重复关闭后两次 分配 会拿到同一槽位，
+        // 后一个资源覆盖（并关闭）前一个，两个对象共用同一句柄。
+        if matches!(self.槽位[i], 网络槽位::空槽) { return; }
+        self.槽位[i] = 网络槽位::空槽;
+        self.空闲.push(i);
     }
     fn 读取(&self, 句柄: u64) -> &网络槽位 {
         // 句柄越界清晰诊断（此前 <5000 的悬空句柄会触发 usize 下溢 panic，难以排查）
-        if 句柄 < 5000 {
-            panic!("网络句柄无效：{}（合法句柄自 5000 起；疑似读取了未初始化或已释放的资源）", 句柄);
-        }
+        // 无效/越界句柄按「已关闭的空槽」处理，由各调用点走既有的「已关闭」分支（抛异常或返回空）。
+        // 旧实现在这里 panic，而调用方此时持有全局 网络表 锁 → 锁中毒，此后进程内所有网络调用全部失败。
+        static 无效槽: 网络槽位 = 网络槽位::空槽;
+        if 句柄 < 5000 { return &无效槽; }
         let i = 句柄 as usize - 5000;
-        if i >= self.槽位.len() {
-            panic!("网络句柄越界：{}（当前表长 {}）", 句柄, self.槽位.len());
-        }
-        &self.槽位[i]
+        self.槽位.get(i).unwrap_or(&无效槽)
     }
     /// 预留：与 `读取` 配对的对称可变访问器（当前未调用）；显式豁免 dead_code。
     #[allow(dead_code)]
@@ -116,7 +129,7 @@ pub fn HTTP构造网络请求(请求: &Http待处理请求) -> 运行时值 {
     let 网址句柄 = 分配文本(请求.完整网址.clone());
     let 地址句柄 = 分配文本(请求.客户端地址.clone());
     let 请求头句柄 = 分配映射(文本映射转堆条目(&请求.请求头));
-    let 查询参数句柄 = 解析查询参数(&请求.完整网址);
+    let 查询参数句柄 = 解析查询参数(&请求.原始网址);
     分配结构体(网络请求类型索引, vec![
         运行时值::句柄(方法句柄.句柄), 运行时值::句柄(路径句柄.句柄),
         运行时值::句柄(请求头句柄.句柄), 运行时值::句柄(内容句柄.句柄),
@@ -184,18 +197,57 @@ fn 抛网络异常(消息: String) {
 }
 
 // ── TCP 流读写辅助（统一处理 TcpStream / TLS 流）──
-fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut dyn Read) -> Option<String>) -> Option<String> {
-    let arc_tls: Option<Arc<Mutex<Box<dyn 网络流>>>> = {
-        let 表 = 网络表.lock().unwrap();
-        if let 网络槽位::Tcp连接TLS { ref stream, .. } = *表.读取(资源句柄) { Some(stream.clone()) } else { None }
-    };
-    if let Some(arc) = arc_tls { return 操作(&mut *arc.lock().unwrap()); }
-    let arc: Option<Arc<Mutex<TcpStream>>> = {
-        let 表 = 网络表.lock().unwrap();
-        if let 网络槽位::Tcp连接 { ref stream, .. } = *表.读取(资源句柄) { Some(stream.clone()) } else { None }
-    };
-    if let Some(arc) = arc { 操作(&mut *arc.lock().unwrap()) } else { None }
+/// 带「回退缓冲」的读者：`读取` 遇到被数据块边界切断的多字节字符时，把不完整的尾部字节
+/// 回退到连接的残余缓冲，下一次任意读操作（读取/读取指定/读取一行/读取全部）先消费它。
+struct 带残余读者<'a> {
+    残余: &'a mut Vec<u8>,
+    内: &'a mut dyn Read,
+}
+impl 带残余读者<'_> {
+    fn 回退(&mut self, 字节: &[u8]) {
+        // 回退的字节在时间上早于残余里现存的内容，前插以保持字节序。
+        let mut 新 = 字节.to_vec();
+        新.extend_from_slice(self.残余);
+        *self.残余 = 新;
     }
+}
+impl Read for 带残余读者<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.残余.is_empty() && !buf.is_empty() {
+            let n = self.残余.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.残余[..n]);
+            self.残余.drain(..n);
+            return Ok(n);
+        }
+        self.内.read(buf)
+    }
+}
+
+fn tcp_读(资源句柄: u64, 操作: &dyn Fn(&mut 带残余读者) -> Option<String>) -> Option<String> {
+    enum 流 { 明文(Arc<Mutex<TcpStream>>), 加密(Arc<Mutex<Box<dyn 网络流>>>) }
+    let 取: Option<(流, Arc<Mutex<Vec<u8>>>)> = {
+        let 表 = 网络表.lock().unwrap();
+        match 表.读取(资源句柄) {
+            网络槽位::Tcp连接TLS { stream, 残余, .. } => Some((流::加密(stream.clone()), 残余.clone())),
+            网络槽位::Tcp连接 { stream, 残余, .. } => Some((流::明文(stream.clone()), 残余.clone())),
+            _ => None,
+        }
+    };
+    let (流, 残余) = 取?;
+    // 锁顺序固定：先流后残余（残余只在持有流锁期间访问）
+    match 流 {
+        流::加密(arc) => {
+            let mut 守卫 = arc.lock().unwrap();
+            let mut 残 = 残余.lock().unwrap();
+            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut **守卫 })
+        }
+        流::明文(arc) => {
+            let mut 守卫 = arc.lock().unwrap();
+            let mut 残 = 残余.lock().unwrap();
+            操作(&mut 带残余读者 { 残余: &mut 残, 内: &mut *守卫 })
+        }
+    }
+}
 
     fn tcp_写(资源句柄: u64, 操作: &dyn Fn(&mut dyn Write)) -> bool {
     let arc_tls: Option<Arc<Mutex<Box<dyn 网络流>>>> = {
@@ -447,7 +499,8 @@ fn 解析查询参数(网址: &str) -> 运行时值 {
         if pair.is_empty() { continue; }
         if let Some((k, v)) = pair.split_once('=') {
             if !k.is_empty() {
-                条目.push((堆键::文本(k.to_string()), 分配文本(v.to_string())));
+                // 先切分后解码：旧实现对整条网址解码后再切，值里的 %26(&) / %3D(=) 会被当成分隔符
+                条目.push((堆键::文本(解码网址路径(k)), 分配文本(解码网址路径(v))));
             }
         }
     }
@@ -712,7 +765,12 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                 Ok(resp) => {
                     let 状态码 = resp.status().as_u16();
                     let (头条目, cookie条目) = 收集响应头与Cookie(&resp);
-                    let 内容 = resp.into_body().read_to_string().unwrap_or_default();
+                    let 内容 = match resp.into_body().read_to_string() {
+                        Ok(s) => s,
+                        // 旧实现 unwrap_or_default：响应体读取失败（超限/连接中断/编码错误）时
+                        // 静默返回空内容且状态码照常 200，调用方无从分辨。
+                        Err(e) => { 抛网络异常(format!("HTTP响应体读取失败: {}", e)); return 运行时值::空值(); }
+                    };
                     构建网络响应结构体(状态码, 内容, 头条目, cookie条目)
                 }
                 Err(e) => { 抛网络异常(format!("HTTP GET失败: {}", e)); 运行时值::空值() }
@@ -744,7 +802,12 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                 Ok(resp) => {
                     let 状态码 = resp.status().as_u16();
                     let (头条目, cookie条目) = 收集响应头与Cookie(&resp);
-                    let 内容 = resp.into_body().read_to_string().unwrap_or_default();
+                    let 内容 = match resp.into_body().read_to_string() {
+                        Ok(s) => s,
+                        // 旧实现 unwrap_or_default：响应体读取失败（超限/连接中断/编码错误）时
+                        // 静默返回空内容且状态码照常 200，调用方无从分辨。
+                        Err(e) => { 抛网络异常(format!("HTTP响应体读取失败: {}", e)); return 运行时值::空值(); }
+                    };
                     构建网络响应结构体(状态码, 内容, 头条目, cookie条目)
                 }
                 Err(e) => { 抛网络异常(format!("HTTP POST失败: {}", e)); 运行时值::空值() }
@@ -793,7 +856,12 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                 Ok(resp) => {
                     let 状态码 = resp.status().as_u16();
                     let (头条目, cookie条目) = 收集响应头与Cookie(&resp);
-                    let 内容 = resp.into_body().read_to_string().unwrap_or_default();
+                    let 内容 = match resp.into_body().read_to_string() {
+                        Ok(s) => s,
+                        // 旧实现 unwrap_or_default：响应体读取失败（超限/连接中断/编码错误）时
+                        // 静默返回空内容且状态码照常 200，调用方无从分辨。
+                        Err(e) => { 抛网络异常(format!("HTTP响应体读取失败: {}", e)); return 运行时值::空值(); }
+                    };
                     构建网络响应结构体(状态码, 内容, 头条目, cookie条目)
                 }
                 Err(e) => { 抛网络异常(format!("HTTP {}失败: {}", 方法, e)); 运行时值::空值() }
@@ -948,6 +1016,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                                 let 远端 = 底层.peer_addr().unwrap();
                                 let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接TLS {
                                     stream: Arc::new(Mutex::new(Box::new(tls))),
+                                    残余: Arc::new(Mutex::new(Vec::new())),
                                     底层,
                                     本地地址: 本地.ip().to_string(), 本地端口: 本地.port(),
                                     远端地址: 远端.ip().to_string(), 远端端口: 远端.port(),
@@ -974,6 +1043,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                     let 远端 = stream.peer_addr().unwrap();
                     let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接 {
                         stream: Arc::new(Mutex::new(stream)),
+                        残余: Arc::new(Mutex::new(Vec::new())),
                         本地地址: 本地.ip().to_string(), 本地端口: 本地.port(),
                         远端地址: 远端.ip().to_string(), 远端端口: 远端.port(),
                     });
@@ -992,12 +1062,38 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
             let 连接句柄 = 取句柄(参数, 0); let 字节数 = 取整数(参数, 1) as usize;
             let 资源句柄 = 读字段资源句柄(连接句柄);
             let result = tcp_读(资源句柄, &|reader| {
+                // UTF-8 安全：数据块边界切断的多字节字符不再被替换成 U+FFFD。
+                // 不完整的尾部字节回退到连接残余，留给下一次读；若整块只有一个不完整前缀则继续读
+                // （不能返回空串——空串是「对端已关闭」的信号）。
+                if 字节数 == 0 { return Some(String::new()); }
                 let mut buf = vec![0u8; 字节数.min(65536)];
-                match reader.read(&mut buf) {
-                    Ok(0) => Some(String::new()),
-                    Ok(n) => Some(String::from_utf8_lossy(&buf[..n]).to_string()),
-                    Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => { 抛网络异常("网络读取超时".into()); None }
-                    Err(_) => Some(String::new()),
+                let mut 累积: Vec<u8> = Vec::new();
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => return Some(String::from_utf8_lossy(&累积).into_owned()),
+                        Ok(n) => {
+                            累积.extend_from_slice(&buf[..n]);
+                            match std::str::from_utf8(&累积) {
+                                Ok(s) => return Some(s.to_string()),
+                                // 真正非法的字节序列（不是被切断）：保持原有的替换字符语义
+                                Err(e) if e.error_len().is_some() => return Some(String::from_utf8_lossy(&累积).into_owned()),
+                                Err(e) => {
+                                    let 切 = e.valid_up_to();
+                                    if 切 > 0 {
+                                        reader.回退(&累积[切..]);
+                                        return Some(String::from_utf8_lossy(&累积[..切]).into_owned());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => {
+                            reader.回退(&累积);
+                            抛网络异常("网络读取超时".into());
+                            return None;
+                        }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return Some(String::from_utf8_lossy(&累积).into_owned()),
+                    }
                 }
             });
             分配文本(result.unwrap_or_default())
@@ -1155,6 +1251,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                                     let tls_本地端口 = 底层.local_addr().map(|a| a.port()).unwrap_or(本地.port());
                                     let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接TLS {
                                         stream: Arc::new(Mutex::new(Box::new(tls_stream))),
+                                        残余: Arc::new(Mutex::new(Vec::new())),
                                         底层,
                                         本地地址: 本地.ip().to_string(), 本地端口: tls_本地端口,
                                         远端地址: peer.ip().to_string(), 远端端口: peer.port(),
@@ -1172,6 +1269,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         }
                         let 资源 = 网络表.lock().unwrap().分配(网络槽位::Tcp连接 {
                             stream: Arc::new(Mutex::new(stream)),
+                            残余: Arc::new(Mutex::new(Vec::new())),
                             本地地址: 本地.ip().to_string(), 本地端口: 本地.port(),
                             远端地址: peer.ip().to_string(), 远端端口: peer.port(),
                         });
@@ -1321,15 +1419,38 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                 抛网络异常("HTTP服务端TLS启动失败：证书/密钥加载错误（需未加密 PEM）".into());
                 return 运行时值::空值();
             }
-            let 资源 = 网络表.lock().unwrap().分配(网络槽位::网络服务 { 端口 });
-            let tls配置线程 = tls配置.clone();
+            // 绑定在调用线程同步完成：旧实现放在后台线程里且忽略失败，端口被占用时
+            // 启动服务 照样返回一个「成功」的服务对象，之后所有请求都连不上且没有任何报错。
+            let 启动结果 = match &tls配置 {
+                Some(cfg) => crate::tiny_http::Server::https(format!("0.0.0.0:{}", 端口), cfg.clone()),
+                None => crate::tiny_http::Server::http(format!("0.0.0.0:{}", 端口)),
+            };
+            let server = match 启动结果 {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    抛网络异常(format!("HTTP服务启动失败（端口 {}）: {}", 端口, e));
+                    return 运行时值::空值();
+                }
+            };
+            // 端口 0 由系统分配：返回实际绑定端口（与 监听/数据报 一致）
+            let 端口 = server.server_addr().to_ip().map(|a| a.port()).unwrap_or(端口);
+            let 停止 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let 完成 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let 线程标识 = Arc::new(std::sync::OnceLock::new());
+            let 资源 = 网络表.lock().unwrap().分配(网络槽位::网络服务 {
+                端口, 服务: server.clone(), 停止: 停止.clone(), 完成: 完成.clone(), 线程标识: 线程标识.clone(),
+            });
             std::thread::spawn(move || {
-                let 启动结果 = match &tls配置线程 {
-                    Some(cfg) => crate::tiny_http::Server::https(format!("0.0.0.0:{}", 端口), cfg.clone()),
-                    None => crate::tiny_http::Server::http(format!("0.0.0.0:{}", 端口)),
-                };
-                if let Ok(server) = 启动结果 {
-                    for mut req in server.incoming_requests() {
+                let _ = 线程标识.set(std::thread::current().id());
+                {
+                    // 服务关闭 置位 停止 并 unblock；带超时轮询是兜底（unblock 只唤醒一次）。
+                    loop {
+                        if 停止.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                        let mut req = match server.recv_timeout(std::time::Duration::from_millis(200)) {
+                            Ok(Some(r)) => r,
+                            Ok(None) => continue,
+                            Err(_) => break,
+                        };
                         let mut 请求头 = HashMap::new();
                         for h in req.headers() {
                             let 头名 = h.field.to_string();
@@ -1348,7 +1469,7 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         // 此处还原为原始 UTF-8 路径，使 请求.路径() 与源码中写的中文路径一致。
                         let 请求 = Http待处理请求 {
                             方法: req.method().to_string(), 路径: 解码网址路径(&路径), 请求头: 请求头.clone(),
-                            内容: 内容.clone(), 完整网址: 解码网址路径(&url),
+                            内容: 内容.clone(), 完整网址: 解码网址路径(&url), 原始网址: url.clone(),
                             客户端地址: req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
                         };
                         // 构造 网络请求 运行时值（base 全局堆）并同步调用处理器（后台线程）
@@ -1371,9 +1492,16 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                             let 线值 = if 线头名.eq_ignore_ascii_case("Location") {
                                 编码网址中文路径(v)
                             } else { v.clone() };
+                            // 纵深防御：线格式头值含 CR/LF/NUL 一律丢弃（响应拆分），无论它来自哪个构造入口。
+                            if 线值.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+                                eprintln!("[网络服务] 已丢弃含控制字符的响应头：{}", 线头名);
+                                continue;
+                            }
                             match Header::from_bytes(线头名.as_bytes(), 线值.as_bytes()) {
                                 Ok(hdr) => { r = r.with_header(hdr); }
-                                Err(_) => { 抛网络异常(format!("响应头写回失败：{}", 线头名)); }
+                                // 这里是服务后台线程：不能 抛网络异常（线程局部异常标志无人清除，
+                                // 会残留并污染之后所有请求的异常语义），只记录并跳过该头。
+                                Err(_) => { eprintln!("[网络服务] 响应头写回失败：{}", 线头名); }
                             }
                         }
                         // 会话凭证 → 线格式 Set-Cookie（§5.3.4 设置会话凭证 闭环）；
@@ -1385,12 +1513,40 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
                         req.respond(r).ok();
                     }
                 }
+                // 最后一个 Arc 在此释放 ⇒ Server::drop 关闭监听套接字，端口归还系统
+                drop(server);
+                完成.store(true, std::sync::atomic::Ordering::SeqCst);
             });
             return 分配结构体(网络服务类型索引, vec![运行时值::整数(资源 as i64), 运行时值::整数(端口 as i64)]);
         }
         标准库索引::网络_服务关闭 => { // 网络服务.关闭()
+            // 旧实现只清句柄表槽位，后台线程与监听套接字永远存活：端口不释放、请求照常被处理。
             let 服务句柄 = 取句柄(参数, 0);
-            网络表.lock().unwrap().释放(读字段资源句柄(服务句柄));
+            let 资源句柄 = 读字段资源句柄(服务句柄);
+            let 控制 = {
+                let mut 表 = 网络表.lock().unwrap();
+                let 取 = match 表.读取(资源句柄) {
+                    网络槽位::网络服务 { 服务, 停止, 完成, 线程标识, .. } =>
+                        Some((服务.clone(), 停止.clone(), 完成.clone(), 线程标识.clone())),
+                    _ => None,
+                };
+                表.释放(资源句柄);
+                取
+            };
+            if let Some((服务, 停止, 完成, 线程标识)) = 控制 {
+                停止.store(true, std::sync::atomic::Ordering::SeqCst);
+                服务.unblock();
+                drop(服务);
+                // 等后台线程退出（端口真正释放）再返回，便于「关闭后立刻在同端口重启」。
+                // 在处理器内部关闭自身服务时不能等（会等自己），由线程处理完当前请求后自行退出。
+                let 自身线程 = 线程标识.get().map(|t| *t == std::thread::current().id()).unwrap_or(false);
+                if !自身线程 {
+                    let 截止 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while !完成.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < 截止 {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                }
+            }
             运行时值::空值()
         }
         标准库索引::网络_响应成功 => { // 网络.响应成功(内容, 响应头={})
@@ -1429,6 +1585,12 @@ pub(crate) fn 处理网络(索引: usize, 参数: &[运行时值]) -> 运行时�
         }
         标准库索引::网络_响应重定向 => { // 网络.响应重定向(目标网址)
             let 目标 = 取文本(参数, 0);
+            // 目标含控制字符（CR/LF/NUL 等）即拒绝：否则经 Location 头原样上线，构成 HTTP 响应拆分
+            // （可注入任意响应头，如 Set-Cookie）。中文等非 ASCII 字符合法，发送时会做百分号编码。
+            if 目标.chars().any(|c| c.is_control()) {
+                抛网络异常("响应重定向的目标网址含控制字符（回车/换行等），已拒绝".to_string());
+                return 运行时值::空值();
+            }
             // 智语言 API 语义键为中文「位置」；发送时由 147 映射为线格式 "Location"（ASCII 标准），
             // 客户端接收时由 收集响应头与Cookie 再映射回「位置」。中文头名不能直接上线（RFC 9110）。
             let 头条目 = vec![(堆键::文本("位置".into()), 分配文本(目标))];

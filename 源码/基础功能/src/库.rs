@@ -48,9 +48,12 @@ pub use 分发器::系统调用;
 pub use 网络 as tiny_http;     // 别名：网络系统函数.rs 的 tiny_http:: 调用零改动
 pub use 并发 as 公共服务;       // 别名：保留 crate::公共服务::通道 等旧路径（77+ 处引用）
 
-// Windows API 声明
+// Windows API 声明（仅 Windows：其他平台无条件声明会让 libbase.a 带着未定义符号，
+// 用户程序链接时报 undefined reference to GetStdHandle / WriteFile）
+#[cfg(windows)]
 const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5u32;
 
+#[cfg(windows)]
 extern "system" {
     fn GetStdHandle(nStdHandle: u32) -> isize;
     fn WriteFile(hFile: isize, lpBuffer: *const u8, nBytes: u32,
@@ -80,6 +83,17 @@ pub extern "C" fn 智语言分配内存(大小: i64) -> i64 {
 /// 运行时输出
 #[export_name = "智语言输出"]
 pub extern "C" fn 智语言输出(文本: *const u8, 长度: i64) {
+    #[cfg(not(windows))]
+    {
+        use std::io::Write;
+        if 文本.is_null() || 长度 < 0 { return; }
+        let 字节 = unsafe { std::slice::from_raw_parts(文本, 长度 as usize) };
+        let mut 标准输出 = std::io::stdout().lock();
+        let _ = 标准输出.write_all(字节);
+        let _ = 标准输出.write_all(b"\n");
+        let _ = 标准输出.flush();
+    }
+    #[cfg(windows)]
     unsafe {
         let 句柄 = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut 已写入: u32 = 0;

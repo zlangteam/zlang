@@ -53,7 +53,24 @@ impl 通道 {
         if self.已关闭.load(Ordering::SeqCst) {
             return Err(数据);
         }
-        self.数据发送端.send(数据).map_err(|e| e.0)
+        // 快路径：有空位（或同步通道已有接收方在等）直接送达
+        let 数据 = match self.数据发送端.try_send(数据) {
+            Ok(()) => return Ok(()),
+            Err(e) => e.into_inner(),
+        };
+        // 慢路径：通道已满，等「有空位」或「通道被关闭」。
+        // 旧实现直接阻塞在 send 上：通道满时发送方卡住，之后即使通道被关闭也永远不会醒来
+        // （数据发送端与接收端都由通道自身持有，不会断开）。
+        let mut sel = crossbeam::channel::Select::new();
+        let 发送序 = sel.send(&self.数据发送端);
+        let _关闭序 = sel.recv(&self.关闭信号接收端);
+        let 操作 = sel.select();
+        if 操作.index() == 发送序 {
+            操作.send(&self.数据发送端, 数据).map_err(|e| e.0)
+        } else {
+            let _ = 操作.recv(&self.关闭信号接收端);
+            Err(数据)
+        }
     }
 
     /// 接收数据，完整匹配文档关闭语义：

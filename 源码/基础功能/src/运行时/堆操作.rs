@@ -1311,8 +1311,9 @@ pub fn 堆操作(操作码: usize, 参数: &[运行时值]) -> 运行时值 {
             return match (a.标签, b.标签) {
                 (标签_整数, 标签_整数) => {
                     let (x, y) = (a.整数, b.整数);
-                    let mut q = x / y;
-                    let r = x % y;
+                    // i64::MIN 整除 -1 在原生除法下溢出 panic；与加减乘、取余一致采用回绕语义。
+                    let mut q = x.wrapping_div(y);
+                    let r = x.wrapping_rem(y);
                     if r != 0 && ((r < 0) != (y < 0)) { q -= 1; }
                     运行时值::整数(q)
                 }

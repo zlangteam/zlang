@@ -3,7 +3,7 @@
 //   解释模式中 crate::公共服务 被直接链接；编译模式经 C ABI 调用，二者共用同一份运行时。
 
 use crate::值类型::*;
-use std::sync::{LazyLock, Mutex, Arc};
+use std::sync::Arc;
 use super::{运行时值转拥有值, 拥有值转运行时值};
 
 // ── 监听选项缓存（与 crate::公共服务 配合）──
@@ -14,8 +14,12 @@ pub(crate) enum 监听选项 {
     终止信号(String, u64),
 }
 
-pub(crate) static 全局监听缓存: LazyLock<Mutex<Vec<监听选项>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+// 监听选项缓存按线程隔离（一个任务 = 一个线程，注册与 多路监听 总在同一线程）。
+// 旧实现是进程级 Mutex<Vec>：多路监听 阻塞期间一直持锁，其他任务连注册选项都会卡住（死锁），
+// 并且会吞掉别的任务注册的选项（串台）。
+thread_local! {
+    pub(crate) static 线程监听缓存: std::cell::RefCell<Vec<监听选项>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 // 这些函数封装对 crate::公共服务 全局句柄表的访问
 // 在解释模式中，crate::公共服务 被直接链接；在编译模式中，通过 C ABI 调用
